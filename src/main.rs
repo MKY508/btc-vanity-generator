@@ -1,10 +1,15 @@
+use anyhow::Result;
 use bip39::Mnemonic;
 use bitcoin::bip32::{DerivationPath, ExtendedPrivKey};
-use bitcoin::secp256k1::{Secp256k1, XOnlyPublicKey};
+use bitcoin::secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey};
 use bitcoin::{Address, Network, PrivateKey, PublicKey};
+use crossterm::event::{self, Event, KeyCode, KeyEvent};
+use crossterm::terminal::{self, ClearType};
+use rand::rngs::OsRng;
 use rand::RngCore;
-use rand_xoshiro::Xoshiro256PlusPlus;
 use rand_xoshiro::rand_core::SeedableRng;
+use rand_xoshiro::Xoshiro256PlusPlus;
+use rustyline::DefaultEditor;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 use std::str::FromStr;
@@ -13,7 +18,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = "0.2.0";
 const AUTHOR_EMAIL: &str = "mky369258@gmail.com";
 const AUTHOR_GITHUB: &str = "MKY508";
 
@@ -29,6 +34,9 @@ enum Match { Prefix, Suffix, Contains }
 #[derive(Clone, Copy, PartialEq)]
 enum Out { Mnemonic, Wif, Both }
 
+#[derive(Clone, Copy, PartialEq)]
+enum RngMode { Secure, Fast }
+
 #[derive(Clone)]
 struct Target { raw: String, full: String }
 
@@ -37,6 +45,7 @@ struct Settings {
     addr_type: Addr,
     match_mode: Match,
     output: Out,
+    rng_mode: RngMode,
     threads: usize,
     batch_size: u64,
 }
@@ -47,6 +56,7 @@ impl Default for Settings {
             addr_type: Addr::Taproot,
             match_mode: Match::Prefix,
             output: Out::Mnemonic,
+            rng_mode: RngMode::Secure,
             threads: num_cpus::get(),
             batch_size: 512,
         }
@@ -61,19 +71,50 @@ struct Found {
 }
 
 fn clear() {
-    print!("\x1B[2J\x1B[H");
-    io::stdout().flush().unwrap();
+    print!("{}", crossterm::terminal::Clear(ClearType::All));
+    print!("{}", crossterm::cursor::MoveTo(0, 0));
+    io::stdout().flush().ok();
+}
+
+fn read_key() -> Option<char> {
+    terminal::enable_raw_mode().ok()?;
+    let result = loop {
+        if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+            if let Ok(Event::Key(KeyEvent { code, .. })) = event::read() {
+                break match code {
+                    KeyCode::Char(c) => Some(c),
+                    KeyCode::Enter => Some('\n'),
+                    KeyCode::Esc => Some('\x1b'),
+                    _ => None,
+                };
+            }
+        }
+    };
+    terminal::disable_raw_mode().ok();
+    result
 }
 
 fn input(prompt: &str) -> String {
-    print!("{}", prompt);
-    io::stdout().flush().unwrap();
-    let mut s = String::new();
-    io::stdin().read_line(&mut s).unwrap();
-    s.trim().into()
+    terminal::disable_raw_mode().ok();
+    let mut rl = match DefaultEditor::new() {
+        Ok(r) => r,
+        Err(_) => {
+            // fallback to basic input
+            print!("{}", prompt);
+            io::stdout().flush().ok();
+            let mut s = String::new();
+            io::stdin().read_line(&mut s).ok();
+            return s.trim().into();
+        }
+    };
+    match rl.readline(prompt) {
+        Ok(line) => line.trim().to_string(),
+        Err(_) => String::new(),
+    }
 }
 
 fn pause() {
+    terminal::disable_raw_mode().ok();
     input("\n按 Enter 继续...");
 }
 
@@ -85,6 +126,10 @@ fn progress_bar(pct: f64, width: usize) -> String {
 
 fn charset(a: Addr) -> &'static str {
     match a { Addr::Taproot | Addr::SegWit => BECH32, _ => BASE58 }
+}
+
+fn is_bech32(a: Addr) -> bool {
+    matches!(a, Addr::Taproot | Addr::SegWit)
 }
 
 fn base(a: Addr) -> u64 {
@@ -111,6 +156,10 @@ fn out_name(o: Out) -> &'static str {
     match o { Out::Mnemonic => "助记词", Out::Wif => "私钥 (WIF)", Out::Both => "助记词 + 私钥" }
 }
 
+fn rng_name(r: RngMode) -> &'static str {
+    match r { RngMode::Secure => "安全 (OsRng)", RngMode::Fast => "快速 (Xoshiro)" }
+}
+
 fn exp(len: usize, a: Addr) -> u64 { base(a).pow(len as u32) }
 
 fn fmt_num(n: u64) -> String {
@@ -134,12 +183,17 @@ fn fmt_time(s: u64) -> String {
 
 fn validate(s: &str, a: Addr) -> Option<String> {
     let cs = charset(a);
-    let low = s.to_lowercase();
-    let bad: Vec<_> = low.chars().filter(|c| !cs.contains(*c)).collect();
-    if bad.is_empty() { Some(low) } else { None }
+    if is_bech32(a) {
+        // Bech32: 只允许小写
+        let low = s.to_lowercase();
+        if low.chars().all(|c| cs.contains(c)) { Some(low) } else { None }
+    } else {
+        // Base58: 保留大小写
+        if s.chars().all(|c| cs.contains(c)) { Some(s.to_string()) } else { None }
+    }
 }
 
-fn main() {
+fn main() -> Result<()> {
     let mut settings = Settings::default();
 
     loop {
@@ -156,15 +210,18 @@ fn main() {
         println!("  │      [0] 退出                           │");
         println!("  │                                         │");
         println!("  ╰─────────────────────────────────────────╯");
+        println!();
+        println!("  按 1-3 选择  |  0/Esc 退出");
 
-        match input("\n  请选择: ").as_str() {
-            "1" => generate(&settings),
-            "2" => settings_menu(&mut settings),
-            "3" => about(),
-            "0" | "q" => { clear(); println!("\n  再见!\n"); break; }
+        match read_key() {
+            Some('1') => generate(&settings),
+            Some('2') => settings_menu(&mut settings),
+            Some('3') => about(),
+            Some('0') | Some('q') | Some('\x1b') => { clear(); println!("\n  再见!\n"); break; }
             _ => {}
         }
     }
+    Ok(())
 }
 
 fn settings_menu(settings: &mut Settings) {
@@ -178,62 +235,101 @@ fn settings_menu(settings: &mut Settings) {
         println!("    [1] 地址类型    {}", addr_name(settings.addr_type));
         println!("    [2] 匹配模式    {}", match_name(settings.match_mode));
         println!("    [3] 输出格式    {}", out_name(settings.output));
-        println!("    [4] 线程数量    {}", settings.threads);
-        println!("    [5] 批处理量    {}", settings.batch_size);
+        println!("    [4] 随机源      {}", rng_name(settings.rng_mode));
+        println!("    [5] 线程数量    {}", settings.threads);
+        println!("    [6] 批处理量    {}", settings.batch_size);
         println!();
-        println!("    [0] 返回");
+        println!("  按 1-6 选择  |  Esc 返回");
 
-        match input("\n  请选择: ").as_str() {
-            "1" => {
+        match read_key() {
+            Some('1') => {
                 clear();
                 println!("\n  选择地址类型:\n");
                 println!("    [1] Taproot (bc1p) - BIP86");
                 println!("    [2] SegWit  (bc1q) - BIP84");
                 println!("    [3] Legacy  (1...) - BIP44");
                 println!("    [4] P2SH    (3...) - BIP44");
-                settings.addr_type = match input("\n  选择 [1]: ").as_str() {
-                    "2" => Addr::SegWit, "3" => Addr::Legacy, "4" => Addr::P2SH, _ => Addr::Taproot
-                };
+                println!();
+                println!("  按 1-4 选择  |  Esc 返回");
+                match read_key() {
+                    Some('1') => settings.addr_type = Addr::Taproot,
+                    Some('2') => settings.addr_type = Addr::SegWit,
+                    Some('3') => settings.addr_type = Addr::Legacy,
+                    Some('4') => settings.addr_type = Addr::P2SH,
+                    _ => {}
+                }
             }
-            "2" => {
+            Some('2') => {
                 clear();
                 println!("\n  选择匹配模式:\n");
                 println!("    [1] 前缀匹配 ({}xxx...)", pfx(settings.addr_type));
                 println!("    [2] 后缀匹配 (...xxx)");
                 println!("    [3] 包含匹配 (...xxx...)");
-                settings.match_mode = match input("\n  选择 [1]: ").as_str() {
-                    "2" => Match::Suffix, "3" => Match::Contains, _ => Match::Prefix
-                };
+                println!();
+                println!("  按 1-3 选择  |  Esc 返回");
+                match read_key() {
+                    Some('1') => settings.match_mode = Match::Prefix,
+                    Some('2') => settings.match_mode = Match::Suffix,
+                    Some('3') => settings.match_mode = Match::Contains,
+                    _ => {}
+                }
             }
-            "3" => {
+            Some('3') => {
                 clear();
                 println!("\n  选择输出格式:\n");
                 println!("    [1] 助记词 (24词)");
-                println!("    [2] 私钥 (WIF格式)");
+                println!("    [2] 私钥 (WIF格式) - 更快!");
                 println!("    [3] 两者都输出");
-                settings.output = match input("\n  选择 [1]: ").as_str() {
-                    "2" => Out::Wif, "3" => Out::Both, _ => Out::Mnemonic
-                };
+                println!();
+                println!("  按 1-3 选择  |  Esc 返回");
+                match read_key() {
+                    Some('1') => settings.output = Out::Mnemonic,
+                    Some('2') => settings.output = Out::Wif,
+                    Some('3') => settings.output = Out::Both,
+                    _ => {}
+                }
             }
-            "4" => {
+            Some('4') => {
+                clear();
+                println!("\n  选择随机源:\n");
+                println!("    [1] 安全 (OsRng) - 密码学安全，推荐");
+                println!("    [2] 快速 (Xoshiro) - 更快但非密码学安全");
+                println!();
+                println!("    ⚠ 警告: 快速模式使用伪随机数生成器");
+                println!("    理论上可被预测，仅建议测试使用");
+                println!();
+                println!("  按 1-2 选择  |  Esc 返回");
+                match read_key() {
+                    Some('1') => settings.rng_mode = RngMode::Secure,
+                    Some('2') => settings.rng_mode = RngMode::Fast,
+                    _ => {}
+                }
+            }
+            Some('5') => {
                 clear();
                 let max = num_cpus::get();
                 println!("\n  设置线程数量 (1-{}):", max);
                 println!("  当前: {}", settings.threads);
-                if let Ok(n) = input("\n  输入: ").parse::<usize>() {
+                println!();
+                println!("  输入数字后按 Enter  |  直接按 Esc 返回");
+                let s = input("\n  输入: ");
+                if let Ok(n) = s.parse::<usize>() {
                     if n >= 1 && n <= max { settings.threads = n; }
                 }
             }
-            "5" => {
+            Some('6') => {
                 clear();
                 println!("\n  设置批处理量 (64-2048):");
                 println!("  当前: {}", settings.batch_size);
                 println!("  提示: 较大的值减少同步开销");
-                if let Ok(n) = input("\n  输入: ").parse::<u64>() {
+                println!();
+                println!("  输入数字后按 Enter  |  直接按 Esc 返回");
+                let s = input("\n  输入: ");
+                if let Ok(n) = s.parse::<u64>() {
                     if n >= 64 && n <= 2048 { settings.batch_size = n; }
                 }
             }
-            "0" | "" => break,
+            Some('\x1b') => break,
             _ => {}
         }
     }
@@ -262,7 +358,9 @@ fn about() {
     println!();
     println!("    本工具完全本地运行，不联网");
     println!("    请妥善保管生成的密钥");
-    pause();
+    println!();
+    println!("  按任意键返回");
+    read_key();
 }
 
 fn generate(settings: &Settings) {
@@ -274,9 +372,14 @@ fn generate(settings: &Settings) {
     println!();
     println!("    地址前缀: {}", pfx(settings.addr_type));
     println!("    字符集:   {}", charset(settings.addr_type));
+    if !is_bech32(settings.addr_type) {
+        println!("    注意:     Base58 区分大小写!");
+    }
     println!();
     println!("    输入目标字符 (多个用逗号分隔)");
     println!("    例如: test,6666,abc");
+    println!();
+    println!("  ←→ 移动光标  |  Enter 确认  |  留空按 Enter 返回");
     println!();
 
     let raw = input("  目标: ");
@@ -324,9 +427,20 @@ fn generate(settings: &Settings) {
     println!("    地址类型: {}", addr_name(settings.addr_type));
     println!("    匹配模式: {}", match_name(settings.match_mode));
     println!("    输出格式: {}", out_name(settings.output));
-    println!("    线程数量: {}", settings.threads);
+    println!("    随机源:   {}", rng_name(settings.rng_mode));
 
-    if input("\n  开始搜索? [Y/n]: ").to_lowercase() == "n" { return; }
+    if settings.output == Out::Wif {
+        println!();
+        println!("    ⚡ 纯私钥模式: 跳过助记词生成，速度更快!");
+    }
+
+    println!();
+    println!("  Enter/Y 开始  |  Esc/N 返回");
+
+    match read_key() {
+        Some('n') | Some('N') | Some('\x1b') => return,
+        _ => {}
+    }
 
     run_search(settings.clone(), targets);
 }
@@ -380,7 +494,7 @@ fn run_search(settings: Settings, targets: Vec<Target>) {
             println!("    速度: {:>12}/s    已尝试: {:>15}", fmt_num(spd), fmt_num(cur));
             println!("    运气: {:>12}      ETA: {:>15}", luck_tag, eta);
             println!("    耗时: {:>12}", fmt_time(elapsed));
-            io::stdout().flush().unwrap();
+            io::stdout().flush().ok();
         }
     });
 
@@ -397,40 +511,98 @@ fn run_search(settings: Settings, targets: Vec<Target>) {
         hs.push(thread::spawn(move || {
             let secp = Secp256k1::new();
             let path = DerivationPath::from_str(deriv(settings.addr_type)).unwrap();
-            let mut rng = Xoshiro256PlusPlus::from_entropy();
-            let mut ent = [0u8; 32];
             let mut buf = String::with_capacity(64);
             let mut local = 0u64;
+
+            // 根据设置选择 RNG
+            let mut secure_rng = OsRng;
+            let mut fast_rng = Xoshiro256PlusPlus::from_entropy();
+
+            // WIF-only 模式: 直接生成随机私钥，跳过 BIP39/BIP32
+            let wif_only = settings.output == Out::Wif;
 
             loop {
                 if stop.load(Ordering::Relaxed) { break; }
 
                 for _ in 0..settings.batch_size {
-                    rng.fill_bytes(&mut ent);
+                    let (addr, mnemonic_str, secret_key) = if wif_only {
+                        // 快速模式: 直接生成随机私钥
+                        let mut key_bytes = [0u8; 32];
+                        match settings.rng_mode {
+                            RngMode::Secure => secure_rng.fill_bytes(&mut key_bytes),
+                            RngMode::Fast => fast_rng.fill_bytes(&mut key_bytes),
+                        }
 
-                    let mn = match Mnemonic::from_entropy(&ent) { Ok(m) => m, Err(_) => continue };
-                    let seed = mn.to_seed("");
-                    let root = match ExtendedPrivKey::new_master(Network::Bitcoin, &seed) { Ok(r) => r, Err(_) => continue };
-                    let child = match root.derive_priv(&secp, &path) { Ok(k) => k, Err(_) => continue };
+                        let sk = match SecretKey::from_slice(&key_bytes) {
+                            Ok(k) => k,
+                            Err(_) => continue,
+                        };
 
-                    let addr = match settings.addr_type {
-                        Addr::Taproot => {
-                            let kp = child.to_keypair(&secp);
-                            let (x, _) = XOnlyPublicKey::from_keypair(&kp);
-                            Address::p2tr(&secp, x, None, Network::Bitcoin)
+                        let addr = match settings.addr_type {
+                            Addr::Taproot => {
+                                let kp = sk.keypair(&secp);
+                                let (x, _) = XOnlyPublicKey::from_keypair(&kp);
+                                Address::p2tr(&secp, x, None, Network::Bitcoin)
+                            }
+                            Addr::SegWit => {
+                                let pk = PublicKey::new(sk.public_key(&secp));
+                                match Address::p2wpkh(&pk, Network::Bitcoin) {
+                                    Ok(a) => a,
+                                    Err(_) => continue,
+                                }
+                            }
+                            Addr::Legacy => {
+                                let pk = PublicKey::new(sk.public_key(&secp));
+                                Address::p2pkh(&pk, Network::Bitcoin)
+                            }
+                            Addr::P2SH => {
+                                let pk = PublicKey::new(sk.public_key(&secp));
+                                match Address::p2shwpkh(&pk, Network::Bitcoin) {
+                                    Ok(a) => a,
+                                    Err(_) => continue,
+                                }
+                            }
+                        };
+                        (addr, None, sk)
+                    } else {
+                        // 标准模式: BIP39 助记词 -> BIP32 派生
+                        let mut ent = [0u8; 32];
+                        match settings.rng_mode {
+                            RngMode::Secure => secure_rng.fill_bytes(&mut ent),
+                            RngMode::Fast => fast_rng.fill_bytes(&mut ent),
                         }
-                        Addr::SegWit => {
-                            let pk = PublicKey::new(child.to_keypair(&secp).public_key());
-                            Address::p2wpkh(&pk, Network::Bitcoin).unwrap()
-                        }
-                        Addr::Legacy => {
-                            let pk = PublicKey::new(child.to_keypair(&secp).public_key());
-                            Address::p2pkh(&pk, Network::Bitcoin)
-                        }
-                        Addr::P2SH => {
-                            let pk = PublicKey::new(child.to_keypair(&secp).public_key());
-                            Address::p2shwpkh(&pk, Network::Bitcoin).unwrap()
-                        }
+
+                        let mn = match Mnemonic::from_entropy(&ent) { Ok(m) => m, Err(_) => continue };
+                        let seed = mn.to_seed("");
+                        let root = match ExtendedPrivKey::new_master(Network::Bitcoin, &seed) { Ok(r) => r, Err(_) => continue };
+                        let child = match root.derive_priv(&secp, &path) { Ok(k) => k, Err(_) => continue };
+
+                        let addr = match settings.addr_type {
+                            Addr::Taproot => {
+                                let kp = child.to_keypair(&secp);
+                                let (x, _) = XOnlyPublicKey::from_keypair(&kp);
+                                Address::p2tr(&secp, x, None, Network::Bitcoin)
+                            }
+                            Addr::SegWit => {
+                                let pk = PublicKey::new(child.to_keypair(&secp).public_key());
+                                match Address::p2wpkh(&pk, Network::Bitcoin) {
+                                    Ok(a) => a,
+                                    Err(_) => continue,
+                                }
+                            }
+                            Addr::Legacy => {
+                                let pk = PublicKey::new(child.to_keypair(&secp).public_key());
+                                Address::p2pkh(&pk, Network::Bitcoin)
+                            }
+                            Addr::P2SH => {
+                                let pk = PublicKey::new(child.to_keypair(&secp).public_key());
+                                match Address::p2shwpkh(&pk, Network::Bitcoin) {
+                                    Ok(a) => a,
+                                    Err(_) => continue,
+                                }
+                            }
+                        };
+                        (addr, Some(mn.to_string()), child.private_key)
                     };
 
                     buf.clear();
@@ -447,12 +619,12 @@ fn run_search(settings: Settings, targets: Vec<Target>) {
                             cnt.fetch_add(local, Ordering::Relaxed);
                             if !stop.swap(true, Ordering::Relaxed) {
                                 let wif = if settings.output == Out::Wif || settings.output == Out::Both {
-                                    Some(PrivateKey::new(child.private_key, Network::Bitcoin).to_wif())
+                                    Some(PrivateKey::new(secret_key, Network::Bitcoin).to_wif())
                                 } else { None };
                                 let _ = tx.send(Found {
                                     addr: buf.clone(),
                                     mnemonic: if settings.output == Out::Mnemonic || settings.output == Out::Both {
-                                        Some(mn.to_string())
+                                        mnemonic_str.clone()
                                     } else { None },
                                     wif,
                                     target: t.raw.clone(),
@@ -502,7 +674,9 @@ fn run_search(settings: Settings, targets: Vec<Target>) {
             println!();
         }
 
-        println!("    派生路径: {}", deriv(settings.addr_type));
+        if r.mnemonic.is_some() {
+            println!("    派生路径: {}", deriv(settings.addr_type));
+        }
         println!("    匹配目标: {}", r.target);
         println!();
         println!("  ─────────────────────────────────────────");

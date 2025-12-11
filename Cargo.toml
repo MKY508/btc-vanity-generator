@@ -9,8 +9,11 @@ license = "MIT"
 bitcoin = { version = "0.30", features = ["rand"] }
 bip39 = "2.0"
 rand = "0.8"
-rand_xoshiro = "0.6"  # 更快的 PRNG
+rand_xoshiro = "0.6"
 num_cpus = "1.16"
+crossterm = "0.27"    # 跨平台终端控制（即时按键）
+anyhow = "1.0"        # 优雅的错误处理
+rustyline = "14.0"    # 行编辑（支持方向键）
 
 [profile.release]
 opt-level = 3        # 最高优化等级
