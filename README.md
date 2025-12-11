@@ -2,6 +2,8 @@
 
 比特币靓号地址生成器，支持所有主流地址类型。
 
+![效果图](screenshot.png)
+
 ## 功能
 
 - 支持 bc1p (Taproot) / bc1q (SegWit) / 1xxx (Legacy) / 3xxx (P2SH)
@@ -11,9 +13,34 @@
 
 ## 速度估算
 
-基于 Apple M3 芯片 (~15000/s)：
+基于 Apple M3 芯片测试
+
+### 助记词模式 (~5,000/s)
 
 **Bech32 地址 (bc1p/bc1q)** - 32字符集
+
+| 位数 | 期望尝试 | 预计时间 |
+|------|----------|----------|
+| 3 | 32,768 | 7秒 |
+| 4 | 1,048,576 | 3.5分钟 |
+| 5 | 33,554,432 | 1.9小时 |
+| 6 | 1,073,741,824 | 2.5天 |
+| 7 | 34,359,738,368 | 79天 |
+
+**Base58 地址 (1xxx/3xxx)** - 58字符集
+
+| 位数 | 期望尝试 | 预计时间 |
+|------|----------|----------|
+| 3 | 195,112 | 39秒 |
+| 4 | 11,316,496 | 38分钟 |
+| 5 | 656,356,768 | 1.5天 |
+| 6 | 38,068,692,544 | 88天 |
+
+### 私钥模式 (~15,000/s)
+
+跳过助记词生成，速度约为助记词模式的 3 倍。
+
+**Bech32 地址 (bc1p/bc1q)**
 
 | 位数 | 期望尝试 | 预计时间 |
 |------|----------|----------|
@@ -23,7 +50,7 @@
 | 6 | 1,073,741,824 | 20小时 |
 | 7 | 34,359,738,368 | 26天 |
 
-**Base58 地址 (1xxx/3xxx)** - 58字符集
+**Base58 地址 (1xxx/3xxx)**
 
 | 位数 | 期望尝试 | 预计时间 |
 |------|----------|----------|
@@ -36,86 +63,16 @@
 
 ## 编译
 
-### 依赖
-
-- Rust 1.70+
-
-### macOS
+需要 Rust 1.70+
 
 ```bash
-# 安装 Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# 编译
-cd btc-vanity-generator
+# macOS / Linux
 cargo build --release
-
-# 运行
 ./target/release/btc-vanity
-```
 
-### Linux (Ubuntu/Debian)
-
-```bash
-# 安装依赖
-sudo apt update
-sudo apt install -y build-essential curl
-
-# 安装 Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source ~/.cargo/env
-
-# 编译
-cd btc-vanity-generator
+# Windows
 cargo build --release
-
-# 运行
-./target/release/btc-vanity
-```
-
-### Windows
-
-```powershell
-# 1. 下载并安装 Rust: https://rustup.rs
-# 2. 安装 Visual Studio Build Tools (C++ 工具链)
-
-# 编译
-cd btc-vanity-generator
-cargo build --release
-
-# 运行
 .\target\release\btc-vanity.exe
-```
-
-## 使用
-
-```
-=== BTC Vanity Generator ===
-
-地址类型:
-  1. bc1p (Taproot)
-  2. bc1q (SegWit)
-  3. 1xxx (Legacy)
-  4. 3xxx (P2SH)
-
-选择 [1]: 1
-
-目标 (bc1p后面的字符, 逗号分隔):
-  字符集: qpzry9x8gf2tvdw0s3jn54khce6mua7l
-
-输入: test,6666
-
-搜索中...
-
-[  3.2%] 1m23s | 14523/s | 运气:好运 | ETA:42m
-
-=== 找到! ===
-
-地址: bc1ptest7x8gf2tvdw0s3jn54khce6mua7lqpzry9
-助记词: abandon ability able ...
-路径: m/86'/0'/0'/0/0
-
-耗时: 2m15s | 尝试: 1,234,567 | 运气: 0.85x
 ```
 
 ## 字符集
@@ -137,9 +94,9 @@ cargo build --release
 
 ## 安全提示
 
-- 生成的密钥请离线保存
-- 不要截图或存在联网设备
 - 本工具完全本地运行，不联网
+- 生成的密钥请离线保存
+- 按 Enter 后会清屏，建议开启飞行模式运行
 
 ## License
 
