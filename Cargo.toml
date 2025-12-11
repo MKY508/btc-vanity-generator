@@ -1,0 +1,20 @@
+[package]
+name = "btc-vanity"
+version = "0.1.0"
+edition = "2021"
+description = "Bitcoin vanity address generator"
+license = "MIT"
+
+[dependencies]
+bitcoin = { version = "0.30", features = ["rand"] }
+bip39 = "2.0"
+rand = "0.8"
+rand_xoshiro = "0.6"  # 更快的 PRNG
+num_cpus = "1.16"
+
+[profile.release]
+opt-level = 3        # 最高优化等级
+lto = true           # 开启链接时优化 (Link Time Optimization)
+codegen-units = 1    # 牺牲编译速度，换取更紧凑的代码执行速度
+panic = 'abort'      # 去掉恐慌捕获，稍微减少一点体积和开销
+strip = true         # 去除符号表，减小二进制体积（可选，不影响性能）
