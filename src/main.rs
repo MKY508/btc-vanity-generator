@@ -14,16 +14,16 @@ use rustyline::DefaultEditor;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
-use std::io::{self, Read as IoRead, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
-const VERSION: &str = "0.3.0";
+const VERSION: &str = "0.4.0";
 const AUTHOR_EMAIL: &str = "mky369258@gmail.com";
 const AUTHOR_GITHUB: &str = "MKY508";
 
@@ -63,24 +63,8 @@ struct Args {
     threads: Option<usize>,
 }
 
-// 敏感数据包装类型，Drop 时自动清零
-struct SensitiveString(String);
-
-impl SensitiveString {
-    fn new(s: String) -> Self { Self(s) }
-    fn as_str(&self) -> &str { &self.0 }
-}
-
-impl Drop for SensitiveString {
-    fn drop(&mut self) {
-        // 安全清零字符串内容
-        unsafe {
-            let bytes = self.0.as_bytes_mut();
-            std::ptr::write_bytes(bytes.as_mut_ptr(), 0, bytes.len());
-        }
-        self.0.clear();
-    }
-}
+// 敏感数据包装类型，Drop 时自动清零（使用 zeroize crate 安全实现）
+type SensitiveString = Zeroizing<String>;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Addr { Taproot, SegWit, Legacy, P2SH }
@@ -105,6 +89,8 @@ struct Settings {
     rng_mode: RngMode,
     threads: usize,
     batch_size: u64,
+    multi_result: bool,  // 多结果模式
+    case_insensitive: bool,  // 大小写不敏感（Base58）
 }
 
 impl Default for Settings {
@@ -116,6 +102,8 @@ impl Default for Settings {
             rng_mode: RngMode::Secure,
             threads: num_cpus::get(),
             batch_size: 512,
+            multi_result: false,
+            case_insensitive: false,
         }
     }
 }
@@ -139,9 +127,12 @@ struct Session {
     batch_size: u64,
     attempts: u64,
     elapsed_secs: u64,
+    #[serde(default)]
+    id: String,  // 会话ID，用于区分多个会话
 }
 
-const SESSION_FILE: &str = ".btc-vanity-session.json";
+const SESSION_DIR: &str = ".btc-vanity-sessions";
+const OLD_SESSION_FILE: &str = ".btc-vanity-session.json";
 
 fn clear() {
     print!("{}", crossterm::terminal::Clear(ClearType::All));
@@ -150,24 +141,203 @@ fn clear() {
 }
 
 fn save_session(session: &Session) -> Result<()> {
+    std::fs::create_dir_all(SESSION_DIR)?;
+    let filename = format!("{}/{}.json", SESSION_DIR, session.id);
     let json = serde_json::to_string_pretty(session)?;
-    std::fs::write(SESSION_FILE, json)?;
+    std::fs::write(filename, json)?;
     Ok(())
 }
 
-fn load_session() -> Option<Session> {
-    let mut file = File::open(SESSION_FILE).ok()?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).ok()?;
-    serde_json::from_str(&contents).ok()
+fn load_session(id: &str) -> Option<Session> {
+    // 先尝试新版目录
+    let filename = format!("{}/{}.json", SESSION_DIR, id);
+    if let Ok(contents) = std::fs::read_to_string(&filename) {
+        return serde_json::from_str(&contents).ok();
+    }
+    // 再尝试旧版单文件（仅 legacy）
+    if id == "legacy" {
+        if let Ok(contents) = std::fs::read_to_string(OLD_SESSION_FILE) {
+            let mut s: Session = serde_json::from_str(&contents).ok()?;
+            s.id = "legacy".to_string();
+            return Some(s);
+        }
+    }
+    None
 }
 
-fn delete_session() {
-    let _ = std::fs::remove_file(SESSION_FILE);
+fn delete_session(id: &str) {
+    if id == "legacy" {
+        let _ = std::fs::remove_file(OLD_SESSION_FILE);
+    } else {
+        let filename = format!("{}/{}.json", SESSION_DIR, id);
+        let _ = std::fs::remove_file(filename);
+    }
 }
 
-fn has_session() -> bool {
-    Path::new(SESSION_FILE).exists()
+fn list_sessions() -> Vec<Session> {
+    let mut sessions = vec![];
+
+    // 先检查旧版单文件会话
+    if let Ok(contents) = std::fs::read_to_string(OLD_SESSION_FILE) {
+        if let Ok(mut s) = serde_json::from_str::<Session>(&contents) {
+            if s.id.is_empty() {
+                s.id = "legacy".to_string();
+            }
+            sessions.push(s);
+        }
+    }
+
+    // 再读取新版多会话目录
+    if let Ok(dir) = std::fs::read_dir(SESSION_DIR) {
+        for entry in dir.flatten() {
+            if let Some(ext) = entry.path().extension() {
+                if ext == "json" {
+                    if let Ok(contents) = std::fs::read_to_string(entry.path()) {
+                        if let Ok(s) = serde_json::from_str::<Session>(&contents) {
+                            sessions.push(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    sessions.sort_by(|a, b| b.elapsed_secs.cmp(&a.elapsed_secs));
+    sessions
+}
+
+fn generate_session_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    format!("{:x}", ts)
+}
+
+// 检测网络连接状态（尝试连接常见 DNS）
+fn check_network_isolated() -> bool {
+    use std::net::TcpStream;
+    // 尝试连接 Google DNS 和 Cloudflare DNS
+    let targets = [
+        ("8.8.8.8", 53),
+        ("1.1.1.1", 53),
+    ];
+    for (ip, port) in targets {
+        if TcpStream::connect_timeout(
+            &format!("{}:{}", ip, port).parse().unwrap(),
+            Duration::from_millis(500)
+        ).is_ok() {
+            return false; // 有网络连接
+        }
+    }
+    true // 网络隔离
+}
+
+// 发送系统通知和声音提示（macOS）
+fn notify_found(addr: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        // 播放系统提示音
+        let _ = Command::new("afplay")
+            .args(["/System/Library/Sounds/Glass.aiff"])
+            .spawn();
+        // 发送通知
+        let script = format!(
+            "display notification \"地址: {}\" with title \"BTC Vanity\" subtitle \"找到匹配地址!\" sound name \"Glass\"",
+            &addr[..addr.len().min(20)]
+        );
+        let _ = Command::new("osascript")
+            .args(["-e", &script])
+            .spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // 其他平台：终端响铃
+        print!("\x07");
+        let _ = io::stdout().flush();
+    }
+}
+
+// 验证管理员密码（macOS）
+fn verify_admin_password() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::{Command, Stdio};
+        use std::io::Write as IoWrite2;
+
+        println!("\n  🔐 安全验证");
+        println!("  请输入电脑管理员密码以查看敏感信息:");
+        println!("  (密码不会显示，输入后按 Enter)");
+
+        // 使用 rpassword 风格的密码输入
+        terminal::disable_raw_mode().ok();
+        print!("\n  密码: ");
+        io::stdout().flush().ok();
+
+        // 读取密码（不回显）
+        let mut password = String::new();
+        terminal::enable_raw_mode().ok();
+        loop {
+            if let Ok(Event::Key(KeyEvent { code, .. })) = event::read() {
+                match code {
+                    KeyCode::Enter => break,
+                    KeyCode::Char(c) => password.push(c),
+                    KeyCode::Backspace => { password.pop(); }
+                    KeyCode::Esc => {
+                        terminal::disable_raw_mode().ok();
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        terminal::disable_raw_mode().ok();
+        println!();
+
+        // 使用 sudo -S 验证密码
+        let mut child = match Command::new("sudo")
+            .args(["-S", "-v"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn() {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{}", password);
+        }
+        password.zeroize();
+
+        match child.wait() {
+            Ok(status) => status.success(),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // 非 macOS 平台：简单密码验证
+        println!("\n  🔐 安全验证");
+        println!("  请输入查看密码 (默认: btcvanity):");
+        let pwd = input("\n  密码: ");
+        pwd == "btcvanity"
+    }
+}
+
+// 阅后即焚确认
+fn confirm_saved() -> bool {
+    println!("\n  ════════════════════════════════════════");
+    println!("  ⚠️  请确保已安全保存以上信息！");
+    println!("  ════════════════════════════════════════");
+    println!();
+    println!("  输入 'I HAVE SAVED' 确认已保存，屏幕将被清除:");
+    println!("  (防止误触，请完整输入)");
+
+    let confirm = input("\n  确认: ");
+    confirm == "I HAVE SAVED"
 }
 
 fn read_key() -> Option<char> {
@@ -215,7 +385,7 @@ fn pause() {
 fn progress_bar(pct: f64, width: usize) -> String {
     let filled = ((pct / 100.0) * width as f64).min(width as f64) as usize;
     let empty = width.saturating_sub(filled);
-    format!("[{}{}]", "=".repeat(filled), " ".repeat(empty))
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
 }
 
 fn charset(a: Addr) -> &'static str {
@@ -305,16 +475,23 @@ fn run_interactive_mode() -> Result<()> {
 
     loop {
         clear();
-        let has_prev = has_session();
+        let sessions = list_sessions();
+        let has_prev = !sessions.is_empty();
+        let is_isolated = check_network_isolated();
         println!();
         println!("  ╭─────────────────────────────────────────╮");
         println!("  │                                         │");
         println!("  │      BTC Vanity Generator v{}        │", VERSION);
         println!("  │      ─────────────────────────          │");
+        if is_isolated {
+            println!("  │      ✓ 网络隔离 (安全)                  │");
+        } else {
+            println!("  │      ⚠ 检测到网络连接 (建议断网)        │");
+        }
         println!("  │                                         │");
-        println!("  │      [1] 开始生成                       │");
+        println!("  │      [1] 开始新任务                      │");
         if has_prev {
-            println!("  │      [2] 继续上次任务                   │");
+            println!("  │      [2] 继续任务 ({} 个)                │", sessions.len());
             println!("  │      [3] 设置                           │");
             println!("  │      [4] 关于                           │");
         } else {
@@ -333,7 +510,7 @@ fn run_interactive_mode() -> Result<()> {
 
         match read_key() {
             Some('1') => generate(&settings),
-            Some('2') if has_prev => resume_session(),
+            Some('2') if has_prev => select_session(&sessions),
             Some('2') => settings_menu(&mut settings),
             Some('3') if has_prev => settings_menu(&mut settings),
             Some('3') => about(),
@@ -345,12 +522,74 @@ fn run_interactive_mode() -> Result<()> {
     Ok(())
 }
 
-fn resume_session() {
-    let session = match load_session() {
+fn select_session(sessions: &[Session]) {
+    loop {
+        clear();
+        println!();
+        println!("  ╭─────────────────────────────────────────╮");
+        println!("  │             选择任务                    │");
+        println!("  ╰─────────────────────────────────────────╯");
+        println!();
+
+        for (i, s) in sessions.iter().enumerate() {
+            let targets_str = s.targets.join(",");
+            let targets_display = if targets_str.len() > 15 {
+                format!("{}...", &targets_str[..12])
+            } else {
+                targets_str
+            };
+            println!("    [{}] {} | {} | {}",
+                i + 1,
+                targets_display,
+                fmt_time(s.elapsed_secs),
+                fmt_num(s.attempts)
+            );
+        }
+        println!();
+        println!("    [D] 删除任务");
+        println!();
+        println!("  输入数字选择  |  Esc 返回");
+
+        match read_key() {
+            Some('\x1b') => break,
+            Some('d') | Some('D') => {
+                println!("\n  输入要删除的任务编号:");
+                let s = input("  编号: ");
+                if let Ok(n) = s.parse::<usize>() {
+                    if n >= 1 && n <= sessions.len() {
+                        delete_session(&sessions[n - 1].id);
+                        println!("  已删除");
+                        thread::sleep(Duration::from_millis(500));
+                        break; // 返回刷新列表
+                    }
+                }
+            }
+            Some(c) if c.is_ascii_digit() => {
+                let n = c.to_digit(10).unwrap() as usize;
+                if n >= 1 && n <= sessions.len() {
+                    resume_session_by_id(&sessions[n - 1].id);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn resume_session_by_id(id: &str) {
+    let mut session = match load_session(id) {
         Some(s) => s,
         None => return,
     };
+    // 如果是旧版会话，删除旧文件并分配新ID
+    if id == "legacy" {
+        let _ = std::fs::remove_file(OLD_SESSION_FILE);
+        session.id = generate_session_id();
+    }
+    resume_with_session(session);
+}
 
+fn resume_with_session(session: Session) {
     // 恢复设置
     let addr_type = match session.addr_type.as_str() {
         "taproot" => Addr::Taproot,
@@ -387,6 +626,8 @@ fn resume_session() {
         rng_mode,
         threads: session.threads,
         batch_size: session.batch_size,
+        multi_result: false,
+        case_insensitive: false,
     };
 
     // 恢复目标
@@ -415,7 +656,7 @@ fn resume_session() {
     println!("  按任意键继续...");
     read_key();
 
-    run_search(settings, targets, session.attempts, session.elapsed_secs);
+    run_search(settings, targets, session.attempts, session.elapsed_secs, session.id);
 }
 
 fn run_cli_mode(args: Args, target: String) -> Result<()> {
@@ -451,6 +692,8 @@ fn run_cli_mode(args: Args, target: String) -> Result<()> {
         rng_mode: RngMode::Secure,
         threads: args.threads.unwrap_or_else(num_cpus::get),
         batch_size: 512,
+        multi_result: false,
+        case_insensitive: false,
     };
 
     // 解析目标
@@ -495,8 +738,12 @@ fn settings_menu(settings: &mut Settings) {
         println!("    [4] 随机源      {}", rng_name(settings.rng_mode));
         println!("    [5] 线程数量    {}", settings.threads);
         println!("    [6] 批处理量    {}", settings.batch_size);
+        println!("    [7] 多结果模式  {}", if settings.multi_result { "开启" } else { "关闭" });
+        if !is_bech32(settings.addr_type) {
+            println!("    [8] 忽略大小写  {}", if settings.case_insensitive { "开启" } else { "关闭" });
+        }
         println!();
-        println!("  按 1-6 选择  |  Esc 返回");
+        println!("  按 1-8 选择  |  Esc 返回");
 
         match read_key() {
             Some('1') => {
@@ -558,7 +805,31 @@ fn settings_menu(settings: &mut Settings) {
                 println!("  按 1-2 选择  |  Esc 返回");
                 match read_key() {
                     Some('1') => settings.rng_mode = RngMode::Secure,
-                    Some('2') => settings.rng_mode = RngMode::Fast,
+                    Some('2') => {
+                        // 二次确认
+                        clear();
+                        println!("\n  ⚠⚠⚠ 安全警告 ⚠⚠⚠\n");
+                        println!("    快速模式使用 Xoshiro256++ 伪随机数生成器");
+                        println!("    该算法 不是 密码学安全的！");
+                        println!();
+                        println!("    风险:");
+                        println!("    • 生成的私钥理论上可被预测");
+                        println!("    • 不建议用于存储大额资金");
+                        println!();
+                        println!("    仅建议用于:");
+                        println!("    • 测试和演示");
+                        println!("    • 临时地址");
+                        println!();
+                        println!("  输入 'YES' 确认使用快速模式，其他键取消:");
+                        let confirm = input("\n  确认: ");
+                        if confirm == "YES" {
+                            settings.rng_mode = RngMode::Fast;
+                            println!("\n  已切换到快速模式");
+                        } else {
+                            println!("\n  已取消");
+                        }
+                        thread::sleep(Duration::from_millis(800));
+                    }
                     _ => {}
                 }
             }
@@ -585,6 +856,12 @@ fn settings_menu(settings: &mut Settings) {
                 if let Ok(n) = s.parse::<u64>() {
                     if n >= 64 && n <= 2048 { settings.batch_size = n; }
                 }
+            }
+            Some('7') => {
+                settings.multi_result = !settings.multi_result;
+            }
+            Some('8') if !is_bech32(settings.addr_type) => {
+                settings.case_insensitive = !settings.case_insensitive;
             }
             Some('\x1b') => break,
             _ => {}
@@ -699,10 +976,10 @@ fn generate(settings: &Settings) {
         _ => {}
     }
 
-    run_search(settings.clone(), targets, 0, 0);
+    run_search(settings.clone(), targets, 0, 0, generate_session_id());
 }
 
-fn run_search(settings: Settings, targets: Vec<Target>, prev_attempts: u64, prev_elapsed: u64) {
+fn run_search(settings: Settings, targets: Vec<Target>, prev_attempts: u64, prev_elapsed: u64, session_id: String) {
     let stop = Arc::new(AtomicBool::new(false));
     let cnt = Arc::new(AtomicU64::new(prev_attempts));
     let t0 = Instant::now();
@@ -737,6 +1014,7 @@ fn run_search(settings: Settings, targets: Vec<Target>, prev_attempts: u64, prev
         batch_size: settings.batch_size,
         attempts: prev_attempts,
         elapsed_secs: prev_elapsed,
+        id: session_id.clone(),
     };
     let _ = save_session(&session);
 
@@ -755,6 +1033,7 @@ fn run_search(settings: Settings, targets: Vec<Target>, prev_attempts: u64, prev
     let p_cnt = cnt.clone();
     let save_targets: Vec<String> = targets.iter().map(|t| t.raw.clone()).collect();
     let save_settings = settings.clone();
+    let save_session_id = session_id.clone();
     let prog = thread::spawn(move || {
         let bar_width = 35;
         let mut save_counter = 0u32;
@@ -777,15 +1056,24 @@ fn run_search(settings: Settings, targets: Vec<Target>, prev_attempts: u64, prev
             let luck = if cur > 0 { combined_exp as f64 / cur as f64 } else { 0.0 };
             let luck_tag = if luck > 2.0 { "欧皇" } else if luck > 1.0 { "好运" } else if luck > 0.5 { "正常" } else { "非酋" };
 
+            // ETA 置信区间 (25%-75% 分位数，几何分布)
             let eta = if spd > 0 && cur < combined_exp {
-                fmt_time((combined_exp - cur) / spd)
-            } else if cur >= combined_exp { "随时".into() } else { "...".into() };
+                let remaining = combined_exp.saturating_sub(cur);
+                // 25% 分位: ~0.29x, 75% 分位: ~1.39x
+                let eta_low = (remaining as f64 * 0.29 / spd as f64) as u64;
+                let eta_high = (remaining as f64 * 1.39 / spd as f64) as u64;
+                format!("{} ~ {}", fmt_time(eta_low.max(1)), fmt_time(eta_high))
+            } else if cur >= combined_exp {
+                "随时可能".into()
+            } else {
+                "...".into()
+            };
 
             print!("\x1B[6;1H");
             println!("    {} {:>5.1}%", progress_bar(pct, bar_width), pct);
             println!();
             println!("    速度: {:>12}/s    已尝试: {:>15}", fmt_num(spd), fmt_num(cur));
-            println!("    运气: {:>12}      ETA: {:>15}", luck_tag, eta);
+            println!("    运气: {:>12}      ETA: {}", luck_tag, eta);
             println!("    耗时: {:>12}", fmt_time(total_elapsed));
             io::stdout().flush().ok();
 
@@ -813,6 +1101,7 @@ fn run_search(settings: Settings, targets: Vec<Target>, prev_attempts: u64, prev
                     batch_size: save_settings.batch_size,
                     attempts: cur,
                     elapsed_secs: total_elapsed,
+                    id: save_session_id.clone(),
                 };
                 let _ = save_session(&session);
             }
@@ -941,12 +1230,12 @@ fn run_search(settings: Settings, targets: Vec<Target>, prev_attempts: u64, prev
                             cnt.fetch_add(local, Ordering::Relaxed);
                             if !stop.swap(true, Ordering::Relaxed) {
                                 let wif = if settings.output == Out::Wif || settings.output == Out::Both {
-                                    Some(SensitiveString::new(PrivateKey::new(secret_key, Network::Bitcoin).to_wif()))
+                                    Some(Zeroizing::new(PrivateKey::new(secret_key, Network::Bitcoin).to_wif()))
                                 } else { None };
                                 let _ = tx.send(Found {
                                     addr: buf.clone(),
                                     mnemonic: if settings.output == Out::Mnemonic || settings.output == Out::Both {
-                                        mnemonic_str.clone().map(|m| SensitiveString::new(m.to_string()))
+                                        mnemonic_str.clone().map(|m| Zeroizing::new(m.to_string()))
                                     } else { None },
                                     wif,
                                     target: t.raw.clone(),
@@ -970,12 +1259,15 @@ fn run_search(settings: Settings, targets: Vec<Target>, prev_attempts: u64, prev
 
     if let Ok(r) = rx.recv() {
         // 找到结果，删除会话文件
-        delete_session();
+        delete_session(&session_id);
 
         let dur = t0.elapsed();
         let tot = cnt.load(Ordering::Relaxed);
         let e = exp(r.target.len(), settings.addr_type);
         let luck = e as f64 / tot as f64;
+
+        // 发送系统通知和声音提示
+        notify_found(&r.addr);
 
         clear();
         println!();
@@ -983,12 +1275,34 @@ fn run_search(settings: Settings, targets: Vec<Target>, prev_attempts: u64, prev
         println!("  │            * 找到了! *                  │");
         println!("  ╰─────────────────────────────────────────╯");
         println!();
-        println!("    地址:");
-        println!("    {}", r.addr);
+        println!("    地址: {}", r.addr);
+        println!("    目标: {}", r.target);
+        println!();
+        println!("  ─────────────────────────────────────────");
+        println!("    耗时: {:.2?}  |  尝试: {} 次", dur, fmt_num(tot));
+        println!("    运气: {:.2}x (期望 {} 次)", luck, fmt_num(e));
+        println!("  ─────────────────────────────────────────");
+
+    // 密码验证后才显示敏感信息
+    println!("\n    敏感信息需要验证后查看");
+
+    if !verify_admin_password() {
+        println!("\n  ❌ 验证失败或已取消");
+        println!("  敏感信息未显示，请重新运行程序");
+        pause();
+    } else {
+        // 验证成功，显示敏感信息
+        clear();
+        println!();
+        println!("  ╭─────────────────────────────────────────╮");
+        println!("  │          🔓 敏感信息 (请保存)           │");
+        println!("  ╰─────────────────────────────────────────╯");
+        println!();
+        println!("    地址: {}", r.addr);
         println!();
 
         if let Some(ref m) = r.mnemonic {
-            println!("    助记词:");
+            println!("    助记词 (24词):");
             println!("    {}", m.as_str());
             println!();
         }
@@ -1002,52 +1316,22 @@ fn run_search(settings: Settings, targets: Vec<Target>, prev_attempts: u64, prev
         if r.mnemonic.is_some() {
             println!("    派生路径: {}", deriv(settings.addr_type));
         }
-        println!("    匹配目标: {}", r.target);
         println!();
-        println!("  ─────────────────────────────────────────");
-        println!("    耗时: {:.2?}", dur);
-        println!("    尝试: {} 次", fmt_num(tot));
-        println!("    运气: {:.2}x (期望 {} 次)", luck, fmt_num(e));
-        println!("  ─────────────────────────────────────────");
-        println!();
-        println!("    !! 请立即安全保存以上密钥 !!");
-    
-    // 自动保存到文件 (隐私增强: 伪装文件名 + 600权限)
-    let save_res = (|| -> Result<String> {
-        let filename = ".java_heap_dump.err"; // 伪装成错误日志
-        
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
-        
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600); // 仅所有者可读写
-        }
-        
-        let mut file = options.open(filename)?;
-        
-        writeln!(file, "# [ERROR] Dump timestamp: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))?;
-        writeln!(file, "ADDR: {}", r.addr)?;
-        writeln!(file, "TRGT: {}", r.target)?;
-        if let Some(ref m) = r.mnemonic {
-            writeln!(file, "MNEM: {}", m.as_str())?;
-        }
-        if let Some(ref w) = r.wif {
-            writeln!(file, "PRIV: {}", w.as_str())?;
-        }
-        writeln!(file, "# End dump\n")?;
-        Ok(filename.to_string())
-    })();
 
-    if let Ok(f) = save_res {
-        println!("\n    [已安全保存至隐藏文件: {}]", f);
-        println!("    (权限已限制为 600, 文件名已伪装)");
-    } else {
-        println!("\n    [!] 自动保存失败: {:?}", save_res.err());
+        // 阅后即焚确认
+        loop {
+            if confirm_saved() {
+                // 标准终端清屏
+                print!("\x1B[2J\x1B[3J\x1B[H");
+                io::stdout().flush().ok();
+                println!("\n  ✓ 屏幕已清除");
+                pause();
+                break;
+            } else {
+                println!("\n  请输入完整的 'I HAVE SAVED'");
+            }
+        }
     }
-
-        pause();
     }
 
     for h in hs { let _ = h.join(); }
@@ -1183,12 +1467,12 @@ fn run_search_cli(settings: Settings, targets: Vec<Target>, pubkey: Option<Strin
                             cnt.fetch_add(local, Ordering::Relaxed);
                             if !stop.swap(true, Ordering::Relaxed) {
                                 let wif = if settings.output == Out::Wif || settings.output == Out::Both {
-                                    Some(SensitiveString::new(PrivateKey::new(secret_key, Network::Bitcoin).to_wif()))
+                                    Some(Zeroizing::new(PrivateKey::new(secret_key, Network::Bitcoin).to_wif()))
                                 } else { None };
                                 let _ = tx.send(Found {
                                     addr: buf.clone(),
                                     mnemonic: if settings.output == Out::Mnemonic || settings.output == Out::Both {
-                                        mnemonic_str.clone().map(|m| SensitiveString::new(m.to_string()))
+                                        mnemonic_str.clone().map(|m| Zeroizing::new(m.to_string()))
                                     } else { None },
                                     wif,
                                     target: t.raw.clone(),
