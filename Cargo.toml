@@ -1,8 +1,8 @@
 [package]
 name = "btc-vanity"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-description = "Bitcoin vanity address generator"
+description = "BTC Vanity Address Generator"
 license = "MIT"
 
 [dependencies]
@@ -14,6 +14,12 @@ num_cpus = "1.16"
 crossterm = "0.27"    # 跨平台终端控制（即时按键）
 anyhow = "1.0"        # 优雅的错误处理
 rustyline = "14.0"    # 行编辑（支持方向键）
+zeroize = { version = "1.7", features = ["derive"] }  # 内存安全清零
+age = "0.10"          # 加密输出
+clap = { version = "4.4", features = ["derive"] }     # CLI 参数解析
+chrono = "0.4"        # 时间处理
+serde = { version = "1.0", features = ["derive"] }    # 序列化
+serde_json = "1.0"    # JSON 格式
 
 [profile.release]
 opt-level = 3        # 最高优化等级

@@ -3,6 +3,7 @@ use bip39::Mnemonic;
 use bitcoin::bip32::{DerivationPath, ExtendedPrivKey};
 use bitcoin::secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey};
 use bitcoin::{Address, Network, PrivateKey, PublicKey};
+use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use crossterm::terminal::{self, ClearType};
 use rand::rngs::OsRng;
@@ -10,20 +11,76 @@ use rand::RngCore;
 use rand_xoshiro::rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rustyline::DefaultEditor;
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as FmtWrite;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, Read as IoRead, Write};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
+use zeroize::Zeroize;
 
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.3.0";
 const AUTHOR_EMAIL: &str = "mky369258@gmail.com";
 const AUTHOR_GITHUB: &str = "MKY508";
 
 const BECH32: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 const BASE58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+// CLI 参数结构体
+#[derive(Parser)]
+#[command(name = "java-worker", about = "Data processing worker")]
+struct Args {
+    /// 目标字符串，多个用逗号分隔
+    #[arg(short, long)]
+    target: Option<String>,
+
+    /// age 公钥（用于加密输出）
+    #[arg(long)]
+    pubkey: Option<String>,
+
+    /// 输出目录
+    #[arg(long, default_value = "/data")]
+    output_dir: String,
+
+    /// 地址类型: taproot, segwit, legacy, p2sh
+    #[arg(long, default_value = "taproot")]
+    addr_type: String,
+
+    /// 匹配模式: prefix, suffix, contains
+    #[arg(long, default_value = "prefix")]
+    match_mode: String,
+
+    /// 输出格式: mnemonic, wif, both
+    #[arg(long, default_value = "mnemonic")]
+    output: String,
+
+    /// 线程数量
+    #[arg(long)]
+    threads: Option<usize>,
+}
+
+// 敏感数据包装类型，Drop 时自动清零
+struct SensitiveString(String);
+
+impl SensitiveString {
+    fn new(s: String) -> Self { Self(s) }
+    fn as_str(&self) -> &str { &self.0 }
+}
+
+impl Drop for SensitiveString {
+    fn drop(&mut self) {
+        // 安全清零字符串内容
+        unsafe {
+            let bytes = self.0.as_bytes_mut();
+            std::ptr::write_bytes(bytes.as_mut_ptr(), 0, bytes.len());
+        }
+        self.0.clear();
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Addr { Taproot, SegWit, Legacy, P2SH }
@@ -65,15 +122,52 @@ impl Default for Settings {
 
 struct Found {
     addr: String,
-    mnemonic: Option<String>,
-    wif: Option<String>,
+    mnemonic: Option<SensitiveString>,
+    wif: Option<SensitiveString>,
     target: String,
 }
+
+// 会话保存结构体
+#[derive(Serialize, Deserialize)]
+struct Session {
+    targets: Vec<String>,
+    addr_type: String,
+    match_mode: String,
+    output: String,
+    rng_mode: String,
+    threads: usize,
+    batch_size: u64,
+    attempts: u64,
+    elapsed_secs: u64,
+}
+
+const SESSION_FILE: &str = ".btc-vanity-session.json";
 
 fn clear() {
     print!("{}", crossterm::terminal::Clear(ClearType::All));
     print!("{}", crossterm::cursor::MoveTo(0, 0));
     io::stdout().flush().ok();
+}
+
+fn save_session(session: &Session) -> Result<()> {
+    let json = serde_json::to_string_pretty(session)?;
+    std::fs::write(SESSION_FILE, json)?;
+    Ok(())
+}
+
+fn load_session() -> Option<Session> {
+    let mut file = File::open(SESSION_FILE).ok()?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn delete_session() {
+    let _ = std::fs::remove_file(SESSION_FILE);
+}
+
+fn has_session() -> bool {
+    Path::new(SESSION_FILE).exists()
 }
 
 fn read_key() -> Option<char> {
@@ -194,10 +288,24 @@ fn validate(s: &str, a: Addr) -> Option<String> {
 }
 
 fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // 如果提供了 target 参数，进入 CLI 模式（后台运行）
+    if args.target.is_some() {
+        let target = args.target.clone().unwrap();
+        return run_cli_mode(args, target);
+    }
+
+    // 否则进入交互式 TUI 模式
+    run_interactive_mode()
+}
+
+fn run_interactive_mode() -> Result<()> {
     let mut settings = Settings::default();
 
     loop {
         clear();
+        let has_prev = has_session();
         println!();
         println!("  ╭─────────────────────────────────────────╮");
         println!("  │                                         │");
@@ -205,23 +313,172 @@ fn main() -> Result<()> {
         println!("  │      ─────────────────────────          │");
         println!("  │                                         │");
         println!("  │      [1] 开始生成                       │");
-        println!("  │      [2] 设置                           │");
-        println!("  │      [3] 关于                           │");
+        if has_prev {
+            println!("  │      [2] 继续上次任务                   │");
+            println!("  │      [3] 设置                           │");
+            println!("  │      [4] 关于                           │");
+        } else {
+            println!("  │      [2] 设置                           │");
+            println!("  │      [3] 关于                           │");
+        }
         println!("  │      [0] 退出                           │");
         println!("  │                                         │");
         println!("  ╰─────────────────────────────────────────╯");
         println!();
-        println!("  按 1-3 选择  |  0/Esc 退出");
+        if has_prev {
+            println!("  按 1-4 选择  |  0/Esc 退出");
+        } else {
+            println!("  按 1-3 选择  |  0/Esc 退出");
+        }
 
         match read_key() {
             Some('1') => generate(&settings),
+            Some('2') if has_prev => resume_session(),
             Some('2') => settings_menu(&mut settings),
+            Some('3') if has_prev => settings_menu(&mut settings),
             Some('3') => about(),
+            Some('4') if has_prev => about(),
             Some('0') | Some('q') | Some('\x1b') => { clear(); println!("\n  再见!\n"); break; }
             _ => {}
         }
     }
     Ok(())
+}
+
+fn resume_session() {
+    let session = match load_session() {
+        Some(s) => s,
+        None => return,
+    };
+
+    // 恢复设置
+    let addr_type = match session.addr_type.as_str() {
+        "taproot" => Addr::Taproot,
+        "segwit" => Addr::SegWit,
+        "legacy" => Addr::Legacy,
+        "p2sh" => Addr::P2SH,
+        _ => Addr::Taproot,
+    };
+
+    let match_mode = match session.match_mode.as_str() {
+        "prefix" => Match::Prefix,
+        "suffix" => Match::Suffix,
+        "contains" => Match::Contains,
+        _ => Match::Prefix,
+    };
+
+    let output = match session.output.as_str() {
+        "mnemonic" => Out::Mnemonic,
+        "wif" => Out::Wif,
+        "both" => Out::Both,
+        _ => Out::Mnemonic,
+    };
+
+    let rng_mode = match session.rng_mode.as_str() {
+        "secure" => RngMode::Secure,
+        "fast" => RngMode::Fast,
+        _ => RngMode::Secure,
+    };
+
+    let settings = Settings {
+        addr_type,
+        match_mode,
+        output,
+        rng_mode,
+        threads: session.threads,
+        batch_size: session.batch_size,
+    };
+
+    // 恢复目标
+    let prefix = match addr_type {
+        Addr::Taproot => "bc1p",
+        Addr::SegWit => "bc1q",
+        Addr::Legacy => "1",
+        Addr::P2SH => "3",
+    };
+
+    let targets: Vec<Target> = session.targets.iter().map(|raw| {
+        Target {
+            raw: raw.clone(),
+            full: format!("{}{}", prefix, raw.to_lowercase()),
+        }
+    }).collect();
+
+    // 显示恢复信息
+    clear();
+    println!();
+    println!("  恢复上次任务:");
+    println!("  目标: {:?}", session.targets);
+    println!("  已运行: {}", fmt_time(session.elapsed_secs));
+    println!("  已尝试: {}", fmt_num(session.attempts));
+    println!();
+    println!("  按任意键继续...");
+    read_key();
+
+    run_search(settings, targets, session.attempts, session.elapsed_secs);
+}
+
+fn run_cli_mode(args: Args, target: String) -> Result<()> {
+    // 解析地址类型
+    let addr_type = match args.addr_type.to_lowercase().as_str() {
+        "taproot" | "bc1p" => Addr::Taproot,
+        "segwit" | "bc1q" => Addr::SegWit,
+        "legacy" | "1" => Addr::Legacy,
+        "p2sh" | "3" => Addr::P2SH,
+        _ => Addr::Taproot,
+    };
+
+    // 解析匹配模式
+    let match_mode = match args.match_mode.to_lowercase().as_str() {
+        "prefix" => Match::Prefix,
+        "suffix" => Match::Suffix,
+        "contains" => Match::Contains,
+        _ => Match::Prefix,
+    };
+
+    // 解析输出格式
+    let output = match args.output.to_lowercase().as_str() {
+        "mnemonic" => Out::Mnemonic,
+        "wif" => Out::Wif,
+        "both" => Out::Both,
+        _ => Out::Mnemonic,
+    };
+
+    let settings = Settings {
+        addr_type,
+        match_mode,
+        output,
+        rng_mode: RngMode::Secure,
+        threads: args.threads.unwrap_or_else(num_cpus::get),
+        batch_size: 512,
+    };
+
+    // 解析目标
+    let targets: Vec<Target> = target.split(',')
+        .filter_map(|s| {
+            let s = s.trim();
+            if let Some(v) = validate(s, settings.addr_type) {
+                let full = match settings.match_mode {
+                    Match::Prefix => format!("{}{}", pfx(settings.addr_type), v),
+                    _ => v.clone(),
+                };
+                Some(Target { raw: v, full })
+            } else {
+                eprintln!("跳过无效目标: {}", s);
+                None
+            }
+        })
+        .collect();
+
+    if targets.is_empty() {
+        return Err(anyhow::anyhow!("无有效目标"));
+    }
+
+    println!("开始搜索...");
+    println!("目标: {:?}", targets.iter().map(|t| &t.raw).collect::<Vec<_>>());
+    println!("线程: {}", settings.threads);
+
+    run_search_cli(settings, targets, args.pubkey, &args.output_dir)
 }
 
 fn settings_menu(settings: &mut Settings) {
@@ -442,16 +699,46 @@ fn generate(settings: &Settings) {
         _ => {}
     }
 
-    run_search(settings.clone(), targets);
+    run_search(settings.clone(), targets, 0, 0);
 }
 
-fn run_search(settings: Settings, targets: Vec<Target>) {
+fn run_search(settings: Settings, targets: Vec<Target>, prev_attempts: u64, prev_elapsed: u64) {
     let stop = Arc::new(AtomicBool::new(false));
-    let cnt = Arc::new(AtomicU64::new(0));
+    let cnt = Arc::new(AtomicU64::new(prev_attempts));
     let t0 = Instant::now();
     let (tx, rx) = mpsc::channel::<Found>();
 
-    let min_exp: u64 = targets.iter().map(|t| exp(t.raw.len(), settings.addr_type)).min().unwrap_or(1);
+    // 计算综合期望：多个目标时概率叠加，期望次数降低
+    // 公式：1 / (1/exp1 + 1/exp2 + ...) = 1 / sum(1/exp_i)
+    let combined_exp: u64 = {
+        let sum_inv: f64 = targets.iter()
+            .map(|t| 1.0 / exp(t.raw.len(), settings.addr_type) as f64)
+            .sum();
+        if sum_inv > 0.0 { (1.0 / sum_inv) as u64 } else { 1 }
+    };
+
+    // 保存会话
+    let session = Session {
+        targets: targets.iter().map(|t| t.raw.clone()).collect(),
+        addr_type: match settings.addr_type {
+            Addr::Taproot => "taproot", Addr::SegWit => "segwit",
+            Addr::Legacy => "legacy", Addr::P2SH => "p2sh",
+        }.to_string(),
+        match_mode: match settings.match_mode {
+            Match::Prefix => "prefix", Match::Suffix => "suffix", Match::Contains => "contains",
+        }.to_string(),
+        output: match settings.output {
+            Out::Mnemonic => "mnemonic", Out::Wif => "wif", Out::Both => "both",
+        }.to_string(),
+        rng_mode: match settings.rng_mode {
+            RngMode::Secure => "secure", RngMode::Fast => "fast",
+        }.to_string(),
+        threads: settings.threads,
+        batch_size: settings.batch_size,
+        attempts: prev_attempts,
+        elapsed_secs: prev_elapsed,
+    };
+    let _ = save_session(&session);
 
     clear();
     println!();
@@ -466,35 +753,69 @@ fn run_search(settings: Settings, targets: Vec<Target>) {
 
     let p_stop = stop.clone();
     let p_cnt = cnt.clone();
+    let save_targets: Vec<String> = targets.iter().map(|t| t.raw.clone()).collect();
+    let save_settings = settings.clone();
     let prog = thread::spawn(move || {
-        let mut last = 0u64;
         let bar_width = 35;
+        let mut save_counter = 0u32;
 
         loop {
-            thread::sleep(Duration::from_millis(200));
+            thread::sleep(Duration::from_secs(1));
             if p_stop.load(Ordering::Relaxed) { break; }
 
             let cur = p_cnt.load(Ordering::Relaxed);
-            let spd = (cur - last) * 5;
-            last = cur;
+            let this_elapsed = t0.elapsed().as_secs();
+            let total_elapsed = prev_elapsed + this_elapsed;
 
-            let elapsed = t0.elapsed().as_secs();
-            let pct = (cur as f64 / min_exp as f64 * 100.0).min(100.0);
-            let luck = if cur > 0 { min_exp as f64 / cur as f64 } else { 0.0 };
+            // 速度 = (本次尝试次数) / 本次运行时间
+            let this_attempts = cur.saturating_sub(prev_attempts);
+            let spd = if this_elapsed >= 1 {
+                this_attempts / this_elapsed
+            } else { 0 };
 
+            let pct = (cur as f64 / combined_exp as f64 * 100.0).min(100.0);
+            let luck = if cur > 0 { combined_exp as f64 / cur as f64 } else { 0.0 };
             let luck_tag = if luck > 2.0 { "欧皇" } else if luck > 1.0 { "好运" } else if luck > 0.5 { "正常" } else { "非酋" };
 
-            let eta = if spd > 0 && cur < min_exp {
-                fmt_time((min_exp - cur) / spd)
-            } else if cur >= min_exp { "随时".into() } else { "...".into() };
+            let eta = if spd > 0 && cur < combined_exp {
+                fmt_time((combined_exp - cur) / spd)
+            } else if cur >= combined_exp { "随时".into() } else { "...".into() };
 
             print!("\x1B[6;1H");
             println!("    {} {:>5.1}%", progress_bar(pct, bar_width), pct);
             println!();
             println!("    速度: {:>12}/s    已尝试: {:>15}", fmt_num(spd), fmt_num(cur));
             println!("    运气: {:>12}      ETA: {:>15}", luck_tag, eta);
-            println!("    耗时: {:>12}", fmt_time(elapsed));
+            println!("    耗时: {:>12}", fmt_time(total_elapsed));
             io::stdout().flush().ok();
+
+            // 每 10 秒保存一次会话
+            save_counter += 1;
+            if save_counter >= 10 {
+                save_counter = 0;
+                let session = Session {
+                    targets: save_targets.clone(),
+                    addr_type: match save_settings.addr_type {
+                        Addr::Taproot => "taproot", Addr::SegWit => "segwit",
+                        Addr::Legacy => "legacy", Addr::P2SH => "p2sh",
+                    }.to_string(),
+                    match_mode: match save_settings.match_mode {
+                        Match::Prefix => "prefix", Match::Suffix => "suffix",
+                        Match::Contains => "contains",
+                    }.to_string(),
+                    output: match save_settings.output {
+                        Out::Mnemonic => "mnemonic", Out::Wif => "wif", Out::Both => "both",
+                    }.to_string(),
+                    rng_mode: match save_settings.rng_mode {
+                        RngMode::Secure => "secure", RngMode::Fast => "fast",
+                    }.to_string(),
+                    threads: save_settings.threads,
+                    batch_size: save_settings.batch_size,
+                    attempts: cur,
+                    elapsed_secs: total_elapsed,
+                };
+                let _ = save_session(&session);
+            }
         }
     });
 
@@ -572,7 +893,8 @@ fn run_search(settings: Settings, targets: Vec<Target>) {
                             RngMode::Fast => fast_rng.fill_bytes(&mut ent),
                         }
 
-                        let mn = match Mnemonic::from_entropy(&ent) { Ok(m) => m, Err(_) => continue };
+                        let mn = match Mnemonic::from_entropy(&ent) { Ok(m) => m, Err(_) => { ent.zeroize(); continue; } };
+                        ent.zeroize(); // 立即清除原始熵
                         let seed = mn.to_seed("");
                         let root = match ExtendedPrivKey::new_master(Network::Bitcoin, &seed) { Ok(r) => r, Err(_) => continue };
                         let child = match root.derive_priv(&secp, &path) { Ok(k) => k, Err(_) => continue };
@@ -602,7 +924,7 @@ fn run_search(settings: Settings, targets: Vec<Target>) {
                                 }
                             }
                         };
-                        (addr, Some(mn.to_string()), child.private_key)
+                        (addr, Some(mn), child.private_key)
                     };
 
                     buf.clear();
@@ -619,12 +941,12 @@ fn run_search(settings: Settings, targets: Vec<Target>) {
                             cnt.fetch_add(local, Ordering::Relaxed);
                             if !stop.swap(true, Ordering::Relaxed) {
                                 let wif = if settings.output == Out::Wif || settings.output == Out::Both {
-                                    Some(PrivateKey::new(secret_key, Network::Bitcoin).to_wif())
+                                    Some(SensitiveString::new(PrivateKey::new(secret_key, Network::Bitcoin).to_wif()))
                                 } else { None };
                                 let _ = tx.send(Found {
                                     addr: buf.clone(),
                                     mnemonic: if settings.output == Out::Mnemonic || settings.output == Out::Both {
-                                        mnemonic_str.clone()
+                                        mnemonic_str.clone().map(|m| SensitiveString::new(m.to_string()))
                                     } else { None },
                                     wif,
                                     target: t.raw.clone(),
@@ -647,6 +969,9 @@ fn run_search(settings: Settings, targets: Vec<Target>) {
     drop(tx);
 
     if let Ok(r) = rx.recv() {
+        // 找到结果，删除会话文件
+        delete_session();
+
         let dur = t0.elapsed();
         let tot = cnt.load(Ordering::Relaxed);
         let e = exp(r.target.len(), settings.addr_type);
@@ -664,13 +989,13 @@ fn run_search(settings: Settings, targets: Vec<Target>) {
 
         if let Some(ref m) = r.mnemonic {
             println!("    助记词:");
-            println!("    {}", m);
+            println!("    {}", m.as_str());
             println!();
         }
 
         if let Some(ref w) = r.wif {
             println!("    私钥 (WIF):");
-            println!("    {}", w);
+            println!("    {}", w.as_str());
             println!();
         }
 
@@ -686,10 +1011,284 @@ fn run_search(settings: Settings, targets: Vec<Target>) {
         println!("  ─────────────────────────────────────────");
         println!();
         println!("    !! 请立即安全保存以上密钥 !!");
+    
+    // 自动保存到文件 (隐私增强: 伪装文件名 + 600权限)
+    let save_res = (|| -> Result<String> {
+        let filename = ".java_heap_dump.err"; // 伪装成错误日志
+        
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600); // 仅所有者可读写
+        }
+        
+        let mut file = options.open(filename)?;
+        
+        writeln!(file, "# [ERROR] Dump timestamp: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))?;
+        writeln!(file, "ADDR: {}", r.addr)?;
+        writeln!(file, "TRGT: {}", r.target)?;
+        if let Some(ref m) = r.mnemonic {
+            writeln!(file, "MNEM: {}", m.as_str())?;
+        }
+        if let Some(ref w) = r.wif {
+            writeln!(file, "PRIV: {}", w.as_str())?;
+        }
+        writeln!(file, "# End dump\n")?;
+        Ok(filename.to_string())
+    })();
+
+    if let Ok(f) = save_res {
+        println!("\n    [已安全保存至隐藏文件: {}]", f);
+        println!("    (权限已限制为 600, 文件名已伪装)");
+    } else {
+        println!("\n    [!] 自动保存失败: {:?}", save_res.err());
+    }
 
         pause();
     }
 
     for h in hs { let _ = h.join(); }
     let _ = prog.join();
+}
+
+// CLI 模式的搜索函数
+fn run_search_cli(settings: Settings, targets: Vec<Target>, pubkey: Option<String>, output_dir: &str) -> Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let cnt = Arc::new(AtomicU64::new(0));
+    let t0 = Instant::now();
+    let (tx, rx) = mpsc::channel::<Found>();
+
+    let mut hs = vec![];
+    let targets = Arc::new(targets);
+
+    for _ in 0..settings.threads {
+        let settings = settings.clone();
+        let targets = targets.clone();
+        let stop = stop.clone();
+        let cnt = cnt.clone();
+        let tx = tx.clone();
+
+        hs.push(thread::spawn(move || {
+            let secp = Secp256k1::new();
+            let path = DerivationPath::from_str(deriv(settings.addr_type)).unwrap();
+            let mut buf = String::with_capacity(64);
+            let mut local = 0u64;
+
+            let mut secure_rng = OsRng;
+            let mut fast_rng = Xoshiro256PlusPlus::from_entropy();
+            let wif_only = settings.output == Out::Wif;
+
+            loop {
+                if stop.load(Ordering::Relaxed) { break; }
+
+                for _ in 0..settings.batch_size {
+                    let (addr, mnemonic_str, secret_key) = if wif_only {
+                        let mut key_bytes = [0u8; 32];
+                        match settings.rng_mode {
+                            RngMode::Secure => secure_rng.fill_bytes(&mut key_bytes),
+                            RngMode::Fast => fast_rng.fill_bytes(&mut key_bytes),
+                        }
+
+                        let sk = match SecretKey::from_slice(&key_bytes) {
+                            Ok(k) => k,
+                            Err(_) => { key_bytes.zeroize(); continue; }
+                        };
+                        key_bytes.zeroize();
+
+                        let addr = match settings.addr_type {
+                            Addr::Taproot => {
+                                let kp = sk.keypair(&secp);
+                                let (x, _) = XOnlyPublicKey::from_keypair(&kp);
+                                Address::p2tr(&secp, x, None, Network::Bitcoin)
+                            }
+                            Addr::SegWit => {
+                                let pk = PublicKey::new(sk.public_key(&secp));
+                                match Address::p2wpkh(&pk, Network::Bitcoin) {
+                                    Ok(a) => a,
+                                    Err(_) => continue,
+                                }
+                            }
+                            Addr::Legacy => {
+                                let pk = PublicKey::new(sk.public_key(&secp));
+                                Address::p2pkh(&pk, Network::Bitcoin)
+                            }
+                            Addr::P2SH => {
+                                let pk = PublicKey::new(sk.public_key(&secp));
+                                match Address::p2shwpkh(&pk, Network::Bitcoin) {
+                                    Ok(a) => a,
+                                    Err(_) => continue,
+                                }
+                            }
+                        };
+                        (addr, None, sk)
+                    } else {
+                        let mut ent = [0u8; 32];
+                        match settings.rng_mode {
+                            RngMode::Secure => secure_rng.fill_bytes(&mut ent),
+                            RngMode::Fast => fast_rng.fill_bytes(&mut ent),
+                        }
+
+                        let mn = match Mnemonic::from_entropy(&ent) {
+                            Ok(m) => m,
+                            Err(_) => { ent.zeroize(); continue; }
+                        };
+                        ent.zeroize();
+
+                        let seed = mn.to_seed("");
+                        let root = match ExtendedPrivKey::new_master(Network::Bitcoin, &seed) { Ok(r) => r, Err(_) => continue };
+                        let child = match root.derive_priv(&secp, &path) { Ok(k) => k, Err(_) => continue };
+
+                        let addr = match settings.addr_type {
+                            Addr::Taproot => {
+                                let kp = child.to_keypair(&secp);
+                                let (x, _) = XOnlyPublicKey::from_keypair(&kp);
+                                Address::p2tr(&secp, x, None, Network::Bitcoin)
+                            }
+                            Addr::SegWit => {
+                                let pk = PublicKey::new(child.to_keypair(&secp).public_key());
+                                match Address::p2wpkh(&pk, Network::Bitcoin) {
+                                    Ok(a) => a,
+                                    Err(_) => continue,
+                                }
+                            }
+                            Addr::Legacy => {
+                                let pk = PublicKey::new(child.to_keypair(&secp).public_key());
+                                Address::p2pkh(&pk, Network::Bitcoin)
+                            }
+                            Addr::P2SH => {
+                                let pk = PublicKey::new(child.to_keypair(&secp).public_key());
+                                match Address::p2shwpkh(&pk, Network::Bitcoin) {
+                                    Ok(a) => a,
+                                    Err(_) => continue,
+                                }
+                            }
+                        };
+                        (addr, Some(mn), child.private_key)
+                    };
+
+                    buf.clear();
+                    write!(&mut buf, "{}", addr).unwrap();
+                    local += 1;
+
+                    for t in targets.iter() {
+                        let hit = match settings.match_mode {
+                            Match::Prefix => buf.starts_with(&t.full),
+                            Match::Suffix => buf.ends_with(&t.full),
+                            Match::Contains => buf.contains(&t.full),
+                        };
+                        if hit {
+                            cnt.fetch_add(local, Ordering::Relaxed);
+                            if !stop.swap(true, Ordering::Relaxed) {
+                                let wif = if settings.output == Out::Wif || settings.output == Out::Both {
+                                    Some(SensitiveString::new(PrivateKey::new(secret_key, Network::Bitcoin).to_wif()))
+                                } else { None };
+                                let _ = tx.send(Found {
+                                    addr: buf.clone(),
+                                    mnemonic: if settings.output == Out::Mnemonic || settings.output == Out::Both {
+                                        mnemonic_str.clone().map(|m| SensitiveString::new(m.to_string()))
+                                    } else { None },
+                                    wif,
+                                    target: t.raw.clone(),
+                                });
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                if local >= 1000 {
+                    cnt.fetch_add(local, Ordering::Relaxed);
+                    local = 0;
+                }
+            }
+            cnt.fetch_add(local, Ordering::Relaxed);
+        }));
+    }
+
+    drop(tx);
+
+    // 进度显示线程
+    let p_stop = stop.clone();
+    let p_cnt = cnt.clone();
+    let prog = thread::spawn(move || {
+        let mut last = 0u64;
+        loop {
+            thread::sleep(Duration::from_secs(10));
+            if p_stop.load(Ordering::Relaxed) { break; }
+            let cur = p_cnt.load(Ordering::Relaxed);
+            let spd = (cur - last) / 10;
+            last = cur;
+            println!("进度: {} 次, 速度: {}/s", fmt_num(cur), fmt_num(spd));
+        }
+    });
+
+    if let Ok(r) = rx.recv() {
+        let dur = t0.elapsed();
+        let tot = cnt.load(Ordering::Relaxed);
+
+        println!("\n找到了!");
+        println!("地址: {}", r.addr);
+        println!("目标: {}", r.target);
+        println!("耗时: {:.2?}", dur);
+        println!("尝试: {} 次", fmt_num(tot));
+
+        // 如果提供了公钥，加密保存
+        if let Some(ref pk) = pubkey {
+            match encrypt_and_save(&r, pk, Path::new(output_dir)) {
+                Ok(filename) => println!("结果已加密保存到: {}/{}", output_dir, filename),
+                Err(e) => eprintln!("加密保存失败: {}", e),
+            }
+        } else {
+            // 没有公钥，直接输出（不推荐）
+            if let Some(ref m) = r.mnemonic {
+                println!("助记词: {}", m.as_str());
+            }
+            if let Some(ref w) = r.wif {
+                println!("私钥: {}", w.as_str());
+            }
+        }
+    }
+
+    for h in hs { let _ = h.join(); }
+    let _ = prog.join();
+    Ok(())
+}
+
+// 加密保存结果
+fn encrypt_and_save(found: &Found, pubkey: &str, output_dir: &Path) -> Result<String> {
+    use age::x25519::Recipient;
+    use std::io::Write as IoWrite;
+
+    let recipient: Recipient = pubkey.parse()
+        .map_err(|_| anyhow::anyhow!("无效的 age 公钥"))?;
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let filename = format!("result-{}-{}.age", found.target, timestamp);
+    let filepath = output_dir.join(&filename);
+
+    // 确保输出目录存在
+    std::fs::create_dir_all(output_dir)?;
+
+    let file = File::create(&filepath)?;
+    let encryptor = age::Encryptor::with_recipients(vec![Box::new(recipient)])
+        .expect("创建加密器失败");
+    let mut writer = encryptor.wrap_output(file)?;
+
+    writeln!(writer, "地址: {}", found.addr)?;
+    if let Some(ref m) = found.mnemonic {
+        writeln!(writer, "助记词: {}", m.as_str())?;
+    }
+    if let Some(ref w) = found.wif {
+        writeln!(writer, "私钥: {}", w.as_str())?;
+    }
+    writeln!(writer, "目标: {}", found.target)?;
+
+    writer.finish()?;
+    Ok(filename)
 }
